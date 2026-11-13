@@ -22,10 +22,20 @@ AI-assisted community Facebook Page for Nashville and the surrounding counties, 
 Time: all wall-clock math goes through `localParts` / `localSlotToDate` (America/Chicago, with daylight saving; the selfcheck covers the DST days). Do not reintroduce fixed UTC offsets.
 
 ## Home videos (Reels)
-- **Upload:** the `/admin` "Add a home video" form takes the address, city, price, beds/baths/sq ft, features, whose listing it is, an optional caption, and the video. The browser reads the length and size first and warns if it isn't a 3–90 s vertical video. Upload is XHR with a progress bar. CSRF goes in the `X-CSRF` header because multipart has no parsed body. `busboy` streams the file into `VIDEO_DIR` (1 GB limit).
+- **Upload:** the `/admin` "Add a home video" form takes a listing link, whose listing it is, an optional pasted listing description, an optional caption, and the video. The browser reads the length and size first and warns if it isn't a 3–90 s vertical video. Upload is XHR with a progress bar. CSRF goes in the `X-CSRF` header because multipart has no parsed body. `busboy` streams the file into `VIDEO_DIR` (1 GB limit).
 - **Storage:** `VIDEO_DIR` is `$RAILWAY_VOLUME_MOUNT_PATH/videos`, so the Railway service needs a volume (mount `/data`). Without one, uploads vanish on each deploy. `/health` shows `video_on_volume`.
-- **Caption** (`draftVideo`): Claude writes it from the details unless Len typed one. Fair Housing rules apply: describe the home, not who should live there; no school or neighborhood claims. `brokerageLines()` then appends "Listing courtesy of …" for other brokers' listings, plus the `firm_line` setting.
-- **Warnings** (`videoWarnings`): length or shape problems, no phone number in `firm_line` (Tennessee advertising rule: firm name and phone), and a reminder that another broker's listing needs that broker's written OK.
+- **Listing page** (`readListing`): fetched with the honest bot user agent; we don't pose as a browser. It reads the title, og/meta description, JSON-LD and the start of the page text.
+  - As of 2026-11-13, Zillow, Realtor.com, Homes.com and loyaltyhomegroup.com (Lofty) block bots (403/429). Redfin answers.
+  - When a site blocks the reader, the pasted description is what Claude uses.
+- **Caption** (`draftVideo`): Claude pulls out the address and city and writes the caption, unless Len typed his own.
+  - Fair Housing rules apply: describe the home, not who should live there; no school or neighborhood claims.
+  - `brokerageLines()` then appends "Full listing: <link>", "Listing courtesy of …" for other brokers' listings, and the `firm_line` setting.
+  - The URL warning is skipped for videos.
+- **Warnings** (`videoWarnings`):
+  - length or shape problems
+  - no phone number in `firm_line` (Tennessee advertising rule: firm name and phone)
+  - another broker's listing, which needs that broker's written OK
+  - "Could not read the listing page" when Claude had no real listing details
 - **Queue:** videos sit in the same queue and share the 8 slots. They never expire, and they don't trigger an approval email on their own.
 - **Publishing** (`postReel`): `POST /{page}/video_reels` with `upload_phase=start` → upload the bytes to the returned `upload_url` (rupload, `Authorization: OAuth <token>`, `offset`, `file_size`) → `upload_phase=finish`, `video_state=PUBLISHED`, `description`. The post id is stored as `reel:<video_id>` and links to facebook.com/reel/<id>. The file is deleted once posted or rejected.
 

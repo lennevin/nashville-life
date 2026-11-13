@@ -14,7 +14,7 @@ ok(s.checkWarnings('This family-friendly event is free').some(function(w) { retu
 ok(s.checkWarnings('Perfect for a growing family!').length === 0 && s.checkWarnings('Perfect for families!').some(function(w) { return /family/.test(w); }), '"perfect for families" flagged');
 ok(s.checkWarnings('close to top-rated schools').length === 1, 'school quality flagged');
 ok(s.checkWarnings('Home values are expected to rise').length === 1, 'value opinion flagged');
-ok(s.checkWarnings('More at https://x.com').length === 1, 'URL flagged');
+ok(s.checkWarnings('More at https://x.com').length === 1 && s.checkWarnings('Full listing: https://x.com', 'video').length === 0, 'URL flagged, except the listing link on videos');
 
 ok(s.similar(s.titleKey('I-24 closed this weekend near Antioch'), s.titleKey('I-24 closed near Antioch this weekend')) >= 0.6, 'reworded duplicate detected');
 ok(s.similar(s.titleKey('I-24 closed this weekend'), s.titleKey('Nashville library opens new branch')) < 0.6, 'different stories not duplicates');
@@ -67,6 +67,8 @@ ok(s.videoWarnings({}, 'Loyalty Home Group | Real Broker, LLC').some(function(w)
 ok(s.videoWarnings({ own_listing: 'no' }, firm).some(function(w) { return /written OK/.test(w); }), 'other broker listing flagged');
 ok(s.brokerageLines({ own_listing: 'no', listing_brokerage: 'Acme Realty' }, firm) === 'Listing courtesy of Acme Realty\n' + firm, 'listing courtesy line for other brokers');
 ok(s.brokerageLines({ own_listing: 'yes' }, firm) === firm, 'own listing: just the firm line');
+ok(s.brokerageLines({ own_listing: 'yes', listing_url: 'https://x.com/l/1' }, firm) === 'Full listing: https://x.com/l/1\n' + firm, 'listing link goes before the firm line');
+ok(s.videoWarnings({ listing_url: 'https://x.com/l/1', page_read: false }, firm).some(function(w) { return /listing page/.test(w); }), 'unreadable listing page flagged');
 ok(s.postUrl('reel:123') === 'https://www.facebook.com/reel/123' && s.postUrl('1_2') === 'https://www.facebook.com/1/posts/2', 'post links');
 console.log('selfcheck: ' + n + ' checks passed');
 

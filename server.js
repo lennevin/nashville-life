@@ -464,8 +464,9 @@ const WARN_PATTERNS = [
   [/\bgreat time to (buy|sell)\b|\binvest(ment)? opportunit/i, 'Real estate promotion'],
   [/https?:\/\//i, 'URL in post text (link is attached separately)']
 ];
-function checkWarnings(text) {
-  return WARN_PATTERNS.filter(function(p) { return p[0].test(text); }).map(function(p) { return p[1]; });
+// kind "video": the listing link belongs in a Reel caption, so the URL check is skipped there.
+function checkWarnings(text, kind) {
+  return WARN_PATTERNS.filter(function(p) { return p[0].test(text) && !(kind === 'video' && /^URL/.test(p[1])); }).map(function(p) { return p[1]; });
 }
 
 async function draftKept() {
@@ -505,7 +506,7 @@ async function draftKept() {
 }
 
 async function insertDraft(d) {
-  var warnings = checkWarnings(d.message).concat(d.extraWarnings || []);
+  var warnings = checkWarnings(d.message, d.kind).concat(d.extraWarnings || []);
   var r = await pool.query('INSERT INTO drafts (kind, town, category, sensitive, message, link, warnings, image_url, card_headline, source_name, photo, post_by, video_file, video_info) VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8,$9,$10,$11,$12,$13) RETURNING id',
     [d.kind, d.town || 'Nashville', d.category, !!d.sensitive, d.message.trim(), d.link || null, warnings.join('; ') || null, (d.card_headline || '').substring(0, 90),
      d.source_name || null, d.photo || null, d.post_by || null, d.video_file || null, d.video_info ? JSON.stringify(d.video_info) : null]);
@@ -569,13 +570,38 @@ async function draftFiller() {
 }
 
 // ── HOME VIDEOS (Reels) ──────────────────────────────────────────────────────
-// Len uploads a vertical home-for-sale video in /admin with the listing details. Claude writes the caption, the firm
-// line is added at the end, and it waits in the queue like any other draft. Once approved it takes the next open slot
-// and posts as a Reel. Videos never expire from the queue.
+// Len uploads a vertical home-for-sale video in /admin with a link to the listing. The server reads the listing page,
+// Claude writes the caption from it, the link and the firm line are added at the end, and it waits in the queue like any
+// other draft. Once approved it takes the next open slot and posts as a Reel. Videos never expire from the queue.
 const VIDEO_CAPTION_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['caption'],
-  properties: { caption: { type: 'string', description: 'the Reel caption, without the brokerage line' } }
+  type: 'object', additionalProperties: false, required: ['found', 'address', 'city', 'caption'],
+  properties: {
+    found: { type: 'boolean', description: 'true if the listing details include at least the address or the price' },
+    address: { type: 'string', description: 'street address of the home, or "" if not given' },
+    city: { type: 'string', description: 'city or area of the home (for example Franklin or East Nashville), or "" if not given' },
+    caption: { type: 'string', description: 'the Reel caption, without the link or the brokerage line' }
+  }
 };
+function stripTags(html) {
+  return String(html || '').replace(/<(script|style|noscript|svg)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#39;|&rsquo;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
+}
+// What the listing page says about the home: title, description, structured data (JSON-LD) and the start of the page text.
+// Many listing sites render with JavaScript or block bots, so this can come back thin; the caption then says less.
+async function readListing(url) {
+  var r = await axios.get(url, { timeout: 20000, maxContentLength: 5 * 1024 * 1024, responseType: 'text', headers: { 'User-Agent': BOT_UA } });
+  var html = String(r.data || '');
+  function meta(name) {
+    var m = html.match(new RegExp('<meta[^>]+(?:property|name)=["\']' + name + '["\'][^>]*>', 'i'));
+    var c = m && m[0].match(/content=["']([^"']*)["']/i);
+    return c ? stripTags(c[1]) : '';
+  }
+  var title = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1];
+  var ld = [];
+  html.replace(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi, function(m, j) { ld.push(j.replace(/\s+/g, ' ').trim()); return m; });
+  return ['Page title: ' + stripTags(title || meta('og:title')), 'Description: ' + (meta('og:description') || meta('description')),
+    ld.length ? 'Structured data: ' + ld.join(' ').substring(0, 5000) : '', 'Page text: ' + stripTags(html).substring(0, 5000)].filter(Boolean).join('\n');
+}
 // Problems Facebook or the Tennessee advertising rules would have with this video. Flags only; Len decides.
 function videoWarnings(info, firmLine) {
   var w = [];
@@ -585,33 +611,43 @@ function videoWarnings(info, firmLine) {
   else if (vw && vh && Math.min(vw, vh) < 540) w.push('Video is small (' + vw + 'x' + vh + '); Reels need at least 540x960');
   if (!/\d{3}\D{0,3}\d{3}\D{0,3}\d{4}/.test(firmLine || '')) w.push('Add your firm phone number to the brokerage line in Settings (TN advertising rule)');
   if (info.own_listing === 'no') w.push('Not your listing: you need the listing broker\'s written OK before posting');
+  if (info.listing_url && !info.page_read) w.push('Could not read the listing page; check the caption details');
   return w;
 }
+// The end of every Reel caption: the listing link, "Listing courtesy of" for another broker's listing, then the firm line.
 function brokerageLines(info, firmLine) {
   var lines = [];
+  if (info.listing_url) lines.push('Full listing: ' + info.listing_url);
   if (info.own_listing === 'no' && info.listing_brokerage) lines.push('Listing courtesy of ' + info.listing_brokerage);
   if (firmLine) lines.push(firmLine);
   return lines.join('\n');
 }
 async function draftVideo(info, file) {
   var s = await getSettings();
-  var caption = (info.caption || '').trim();
-  if (!caption) {
-    var details = [['Address', info.address], ['City / area', info.city], ['Price', info.price], ['Beds', info.beds], ['Baths', info.baths],
-      ['Square feet', info.sqft], ['Features', info.features]].filter(function(p) { return p[1]; }).map(function(p) { return p[0] + ': ' + p[1]; }).join('\n');
-    try {
-      var out = await claudeJson('You write captions for home-for-sale video Reels on "The Nashville Life", a community Facebook Page for Nashville, Tennessee. Voice: ' + s.voice + '\n\n' +
-        'Write a short caption (3-5 short lines): a one-line hook about the home, the key facts (city or area, price, beds, baths, square feet) and two or three standout features, ' +
-        'then "Message us for details or a private tour." Use only the details given; never invent features, prices or nearby places. ' +
-        'Up to 3 hashtags at the end, such as #NashvilleHomes or the city name plus "RealEstate". Do not add a brokerage name or phone number; that line is added separately.\n\n' +
-        'Hard rules:\n' + fairHousingRules() +
-        '- Describe the home, not who should live there: no "perfect for families", "ideal for empty nesters", "great for young professionals" or similar.\n' +
-        '- No claims about the neighborhood\'s safety or character, and no school names or ratings.\n' +
-        '- No predictions about values or investment returns.', details || '(no details given)', VIDEO_CAPTION_SCHEMA, 'medium', 2000);
-      caption = (out.caption || '').trim();
-    } catch (e) { console.error('Video caption error:', e.message); }
-    if (!caption) caption = [info.address, info.price, [info.beds && info.beds + ' bd', info.baths && info.baths + ' ba', info.sqft && info.sqft + ' sq ft'].filter(Boolean).join(' · ')].filter(Boolean).join('\n') || 'Home for sale';
+  var caption = (info.caption || '').trim(), page = '';
+  if (info.listing_url) {
+    try { page = await readListing(info.listing_url); } catch (e) { console.error('Listing page error:', info.listing_url, e.message); }
   }
+  try {
+    var out = await claudeJson('You write captions for home-for-sale video Reels on "The Nashville Life", a community Facebook Page for Nashville, Tennessee. Voice: ' + s.voice + '\n\n' +
+      'From the listing details below, pull out the street address and city, and write a short caption (3-5 short lines): a one-line hook about the home, ' +
+      'the key facts (city or area, price, beds, baths, square feet) and two or three standout features, then "Message us for details or a private tour." ' +
+      'Use only facts stated in the listing details; never invent features, prices or nearby places. Ignore site menus, ads and other listings on the page. ' +
+      'Up to 3 hashtags at the end, such as #NashvilleHomes or the city name plus "RealEstate". Do not add a link, brokerage name or phone number; those are added separately. ' +
+      'If Len wrote his own caption, keep it as written and only fill in address and city.\n\n' +
+      'Hard rules:\n' + fairHousingRules() +
+      '- Describe the home, not who should live there: no "perfect for families", "ideal for empty nesters", "great for young professionals" or similar.\n' +
+      '- No claims about the neighborhood\'s safety or character, and no school names or ratings.\n' +
+      '- No predictions about values or investment returns.',
+      (caption ? 'Len\'s caption:\n' + caption + '\n\n' : '') + 'Listing link: ' + (info.listing_url || '(none)') +
+      (info.details ? '\nListing description Len pasted:\n' + info.details : '') + '\nListing page:\n' + (page || '(the listing page could not be read)'),
+      VIDEO_CAPTION_SCHEMA, 'medium', 3000);
+    info.page_read = !!((page || info.details) && out.found); // "page_read" = Claude had real listing details to work from
+    info.address = out.address || '';
+    info.city = out.city || '';
+    if (!caption && out.found) caption = (out.caption || '').trim();
+  } catch (e) { console.error('Video caption error:', e.message); }
+  if (!caption) caption = 'New on the market' + (info.city ? ' in ' + info.city : '') + '. Message us for details or a private tour.';
   var tail = brokerageLines(info, s.firm_line);
   return insertDraft({ kind: 'video', town: info.city || 'Nashville', category: 'real_estate', message: caption + (tail ? '\n\n' + tail : ''),
     card_headline: info.address || 'Home video', video_file: file, video_info: info, extraWarnings: videoWarnings(info, s.firm_line) });
@@ -836,14 +872,14 @@ function draftCard(d, csrf) {
 // Upload form: the browser reads the video's length and size first (to warn before a long upload), then sends it
 // with a progress bar. The file input is last so the listing fields arrive before the video bytes.
 function videoForm(csrf) {
-  function f(name, label, ph) { return '<label>' + label + '<input type="text" name="' + name + '" placeholder="' + esc(ph || '') + '"></label>'; }
   return '<h2>Add a home video</h2><div class="card"><form id="vform">' +
-    '<div class="grid">' + f('address', 'Address', '123 Main St') + f('city', 'City / area', 'Franklin') + f('price', 'Price', '$625,000') +
-    f('beds', 'Beds', '4') + f('baths', 'Baths', '3') + f('sqft', 'Sq ft', '2,450') + '</div>' +
-    '<label class="meta">Key features<textarea name="features" style="min-height:60px" placeholder="Renovated kitchen, fenced yard, 2-car garage, bonus room"></textarea></label>' +
+    '<label class="meta">Listing link (Claude reads the address, price and features from it; the link goes in the Reel caption)' +
+    '<input type="url" name="listing_url" required placeholder="https://..." style="font:inherit;padding:6px;border:1px solid #ccd0d5;border-radius:6px;width:100%;box-sizing:border-box"></label>' +
     '<div class="grid"><label>Whose listing?<select name="own_listing"><option value="yes">Ours (Real Broker)</option><option value="no">Another brokerage (I have their written OK)</option></select></label>' +
-    f('listing_brokerage', 'Listing brokerage (if not ours)', '') + '</div>' +
-    '<label class="meta">Caption (optional: leave blank and Claude writes one)<textarea name="caption" style="min-height:60px"></textarea></label>' +
+    '<label>Listing brokerage (if not ours)<input type="text" name="listing_brokerage"></label></div>' +
+    '<details><summary>Paste the listing description (optional; use it when the site blocks the reader, like Zillow, Realtor.com or Lofty sites)</summary>' +
+    '<textarea name="details" style="min-height:80px" placeholder="Paste the address, price, beds/baths and description from the listing"></textarea></details>' +
+    '<details><summary>Write my own caption instead (optional)</summary><textarea name="caption" style="min-height:60px"></textarea></details>' +
     '<input type="hidden" name="duration"><input type="hidden" name="width"><input type="hidden" name="height">' +
     '<label class="meta">Video (vertical 9:16, 3-90 seconds, MP4 or MOV)<input type="file" name="video" accept="video/*" required></label>' +
     '<div id="vinfo" class="meta"></div><progress id="vprog" value="0" max="100" hidden></progress>' +
@@ -930,7 +966,7 @@ app.post('/admin/draft/:id', requireAdmin, async function(req, res) {
       var cur = (await pool.query('SELECT kind, video_info FROM drafts WHERE id=$1', [id])).rows[0] || {};
       // Video warnings come from the upload (length, shape, consent), not the caption, so keep them.
       var vw = cur.kind === 'video' ? videoWarnings(JSON.parse(cur.video_info || '{}'), (await getSettings()).firm_line) : [];
-      await pool.query("UPDATE drafts SET message=$2, warnings=$3, updated_at=NOW() WHERE id=$1 AND status='pending'", [id, message, checkWarnings(message).concat(vw).join('; ') || null]);
+      await pool.query("UPDATE drafts SET message=$2, warnings=$3, updated_at=NOW() WHERE id=$1 AND status='pending'", [id, message, checkWarnings(message, cur.kind).concat(vw).join('; ') || null]);
       var headline = typeof req.body.card_headline === 'string' ? req.body.card_headline.trim().substring(0, 90) : '';
       if (headline) await pool.query("UPDATE drafts SET card_headline=$2 WHERE id=$1 AND status='pending'", [id, headline]);
       var photo = req.body.photo;
@@ -952,7 +988,7 @@ app.post('/admin/draft/:id', requireAdmin, async function(req, res) {
 
 app.post('/admin/video', requireAdmin, function(req, res) {
   var bb;
-  try { bb = Busboy({ headers: req.headers, limits: { files: 1, fields: 20, fieldSize: 4000, fileSize: 1024 * 1024 * 1024 } }); }
+  try { bb = Busboy({ headers: req.headers, limits: { files: 1, fields: 20, fieldSize: 10000, fileSize: 1024 * 1024 * 1024 } }); }
   catch (e) { return res.status(400).json({ error: 'Expected a video upload' }); }
   var fields = {}, file = null, tooBig = false, written = Promise.resolve();
   bb.on('field', function(k, v) { fields[k] = String(v).trim(); });
@@ -972,8 +1008,9 @@ app.post('/admin/video', requireAdmin, function(req, res) {
       if (!file) return res.status(400).json({ error: 'No video file in the upload' });
       if (tooBig) { removeVideo(file); return res.status(413).json({ error: 'Video is over 1 GB' }); }
       var info = {};
-      ['address', 'city', 'price', 'beds', 'baths', 'sqft', 'features', 'own_listing', 'listing_brokerage', 'caption', 'duration', 'width', 'height']
-        .forEach(function(k) { if (fields[k]) info[k] = fields[k].substring(0, 2000); });
+      ['listing_url', 'own_listing', 'listing_brokerage', 'details', 'caption', 'duration', 'width', 'height']
+        .forEach(function(k) { if (fields[k]) info[k] = fields[k].substring(0, 8000); });
+      if (info.listing_url && !/^https?:\/\/[^\s]+$/i.test(info.listing_url)) { removeVideo(file); return res.status(400).json({ error: 'The listing link must start with http:// or https://' }); }
       var id = await draftVideo(info, file);
       console.log('Video: draft', id, 'from upload', file, (fs.statSync(videoPath(file)).size / 1048576).toFixed(1) + ' MB');
       res.json({ ok: true, id: id });
@@ -1189,7 +1226,7 @@ if (require.main === module) {
   }).catch(function(e) { console.error('Startup failed:', e.message); process.exit(1); });
 }
 
-module.exports = { app: app, pool: pool, videoForm: videoForm, initDb: initDb, draftFiller: draftFiller, draftVideo: draftVideo, scheduleDraft: scheduleDraft, buildDigest: buildDigest, renderDraftCard: renderDraftCard,
+module.exports = { app: app, pool: pool, videoForm: videoForm, readListing: readListing, initDb: initDb, draftFiller: draftFiller, draftVideo: draftVideo, scheduleDraft: scheduleDraft, buildDigest: buildDigest, renderDraftCard: renderDraftCard,
   dateKeyPlus: dateKeyPlus, cardLabel: cardLabel, PHOTOS: PHOTOS, isPlaceholderImage: isPlaceholderImage, slotTimes: slotTimes, emailHours: emailHours, fmtTime: fmtTime,
   signLink: signLink, verifyLink: verifyLink, renderCard: renderCard, wrapText: wrapText, findPreviewImage: findPreviewImage, photoCaption: photoCaption, checkWarnings: checkWarnings,
   cleanTitle: cleanTitle, titleKey: titleKey, similar: similar, localParts: localParts, localDateParts: localDateParts, localSlotToDate: localSlotToDate, localKey: localKey,
