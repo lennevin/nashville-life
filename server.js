@@ -656,19 +656,33 @@ function videoPath(file) { return path.join(VIDEO_DIR, path.basename(String(file
 function removeVideo(file) { if (file) fs.unlink(videoPath(file), function() {}); }
 
 // Graph API Reels flow: start → upload the bytes to rupload → finish with video_state=PUBLISHED.
+// Each step's error names the step; rupload reports errors as debug_info instead of Graph's error object.
+async function reelStep(step, fn) {
+  try { return await fn(); }
+  catch (e) {
+    var data = e.response && e.response.data, fb = data && (data.error || data.debug_info);
+    throw new Error('Reel ' + step + ' step: ' + (fb ? (fb.message || JSON.stringify(fb)) + (fb.code ? ' (code ' + fb.code + ')' : '') : e.message));
+  }
+}
 async function postReel(d) {
   var file = videoPath(d.video_file);
   var size = fs.statSync(file).size;
-  var start = await axios.post(FB_GRAPH + '/' + FB_PAGE_ID + '/video_reels', new URLSearchParams({ upload_phase: 'start', access_token: FB_PAGE_TOKEN }).toString(),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 30000 });
+  var start = await reelStep('start', function() {
+    return axios.post(FB_GRAPH + '/' + FB_PAGE_ID + '/video_reels', new URLSearchParams({ upload_phase: 'start', access_token: FB_PAGE_TOKEN }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 30000 });
+  });
   var videoId = start.data.video_id;
   var uploadUrl = start.data.upload_url || ('https://rupload.facebook.com/video-upload/' + FB_GRAPH_VERSION + '/' + videoId);
-  await axios.post(uploadUrl, fs.createReadStream(file), {
-    headers: { Authorization: 'OAuth ' + FB_PAGE_TOKEN, offset: '0', file_size: String(size), 'Content-Type': 'application/octet-stream', 'Content-Length': String(size) },
-    maxBodyLength: Infinity, maxContentLength: Infinity, timeout: 15 * 60 * 1000 });
-  var fin = await axios.post(FB_GRAPH + '/' + FB_PAGE_ID + '/video_reels', new URLSearchParams({
-    upload_phase: 'finish', video_id: videoId, video_state: 'PUBLISHED', description: d.message, access_token: FB_PAGE_TOKEN }).toString(),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 60000 });
+  await reelStep('upload', function() {
+    return axios.post(uploadUrl, fs.createReadStream(file), {
+      headers: { Authorization: 'OAuth ' + FB_PAGE_TOKEN, offset: '0', file_size: String(size), 'Content-Type': 'application/octet-stream', 'Content-Length': String(size) },
+      maxBodyLength: Infinity, maxContentLength: Infinity, timeout: 15 * 60 * 1000 });
+  });
+  var fin = await reelStep('finish', function() {
+    return axios.post(FB_GRAPH + '/' + FB_PAGE_ID + '/video_reels', new URLSearchParams({
+      upload_phase: 'finish', video_id: videoId, video_state: 'PUBLISHED', description: d.message, access_token: FB_PAGE_TOKEN }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 60000 });
+  });
   if (!fin.data || fin.data.success === false) throw new Error('Reel finish step failed: ' + JSON.stringify(fin.data));
   return 'reel:' + videoId;
 }
