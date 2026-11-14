@@ -109,7 +109,8 @@ const DEFAULT_SETTINGS = {
   filler_per_day: '2',  // most slow-day community posts drafted for one day; 0 = off
   filler_last: '',      // date slow-day posts were last considered
   core_min_relevance: '6',
-  wider_min_importance: '8'
+  wider_min_importance: '8',
+  drafts_per_check: '6' // most news drafts per news check (3 checks a day); the best stories go first
 };
 
 async function initDb() {
@@ -241,7 +242,54 @@ const SCORE_SCHEMA = {
     } } } }
 };
 
-async function scoreNew() {
+// ── LEARNING FROM LEN'S CHOICES ──────────────────────────────────────────────
+// Every news draft Len approves, rejects or leaves to expire is a vote. The screener sees his recent picks and the
+// approval rates by type, area and source, so the queue narrows toward what he actually posts.
+const APPROVED = "('scheduled','publishing','published','failed')";
+async function decisionStats() {
+  var rows = (await pool.query("SELECT f.source_name AS source, f.category, f.town, CASE WHEN d.status IN " + APPROVED + " THEN 'approved' ELSE d.status END AS outcome" +
+    " FROM drafts d JOIN feed_items f ON f.id = d.feed_item_id WHERE d.kind = 'news' AND (d.status IN " + APPROVED + " OR d.status IN ('rejected','expired'))" +
+    " AND d.created_at > NOW() - INTERVAL '90 days'")).rows;
+  var groups = { type: {}, area: {}, source: {} };
+  rows.forEach(function(r) {
+    [['type', (r.category || 'other').replace(/_/g, ' ')], ['area', r.town || 'Other'], ['source', r.source || '?']].forEach(function(g) {
+      var b = groups[g[0]][g[1]] = groups[g[0]][g[1]] || { approved: 0, rejected: 0, expired: 0 };
+      b[r.outcome]++;
+    });
+  });
+  return { total: rows.length, groups: groups };
+}
+function statLines(groups, min) {
+  var out = [];
+  Object.keys(groups).forEach(function(kind) {
+    Object.keys(groups[kind]).forEach(function(name) {
+      var b = groups[kind][name], n = b.approved + b.rejected + b.expired;
+      if (n >= min) out.push({ kind: kind, name: name, n: n, rate: b.approved / n, b: b });
+    });
+  });
+  return out.sort(function(a, b) { return b.n - a.n; });
+}
+async function learnedPreferences() {
+  var st = await decisionStats();
+  if (st.total < 5) return ''; // not enough votes yet
+  var q = "SELECT f.title, f.category, f.town, f.source_name FROM drafts d JOIN feed_items f ON f.id = d.feed_item_id WHERE d.kind = 'news' AND d.status IN ";
+  var fmt = function(r) { return '- ' + r.title + ' (' + (r.category || '').replace(/_/g, ' ') + ', ' + r.town + ', ' + r.source_name + ')'; };
+  var approved = (await pool.query(q + APPROVED + ' ORDER BY d.updated_at DESC LIMIT 40')).rows;
+  var rejected = (await pool.query(q + "('rejected') ORDER BY d.updated_at DESC LIMIT 40")).rows;
+  var expired = (await pool.query(q + "('expired') ORDER BY d.updated_at DESC LIMIT 15")).rows;
+  var rates = statLines(st.groups, 4).map(function(x) {
+    return '- ' + x.kind + ' "' + x.name + '": ' + x.b.approved + ' approved, ' + x.b.rejected + ' rejected, ' + x.b.expired + ' left unapproved';
+  });
+  return '\n\nLen, who runs the Page, reviews every draft. Learn his taste from his choices: score items like the ones he approves higher, ' +
+    'and items like the ones he rejects lower (relevance 4 or less when an item clearly matches what he keeps rejecting). Drafts he left unapproved are a weaker no. ' +
+    'Judge by the kind of story, not exact words, and still keep big, important news even if it is a type he rarely picks.\n' +
+    (rates.length ? 'His approval record (last 90 days):\n' + rates.join('\n') + '\n' : '') +
+    'Recently approved:\n' + (approved.map(fmt).join('\n') || '(none)') +
+    '\nRecently rejected:\n' + (rejected.map(fmt).join('\n') || '(none)') +
+    (expired.length ? '\nRecently left unapproved:\n' + expired.map(fmt).join('\n') : '');
+}
+
+async function scoreNew(prefs) {
   var s = await getSettings();
   var items = (await pool.query("SELECT id, source_name, scope, title, snippet, published_at FROM feed_items WHERE status = 'new' ORDER BY id LIMIT 25")).rows;
   if (!items.length) return 0;
@@ -256,7 +304,7 @@ async function scoreNew() {
     'Middle Tennessee and statewide stories matter only when they are big for Nashville-area residents (I-24, I-40, I-65 or I-440 closures, severe weather, major employers, state laws that change daily life).\n' +
     'New restaurants, shops and businesses opening (or coming soon) in the area are good community news: category openings, relevance 7 or more. ' +
     'Score low: routine council business, minor crimes, sports scores and roster moves, national chain menu items or promotions, product recalls with no local angle, press releases, and national stories that merely mention Nashville. ' +
-    'If an item covers the same story as an earlier item (in this batch or the recent list), set same_story_as to that id. Return one entry per item.';
+    'If an item covers the same story as an earlier item (in this batch or the recent list), set same_story_as to that id. Return one entry per item.' + (prefs || '');
   var user = 'Recently accepted stories (for duplicate detection):\n' +
     (recent.map(function(r) { return '[' + r.id + '] ' + r.title; }).join('\n') || '(none)') +
     '\n\nItems to screen:\n' + items.map(function(it) {
@@ -487,7 +535,9 @@ async function draftKept() {
   var s = await getSettings();
   // News goes stale: kept stories not drafted within 2 days are dropped instead of piling up.
   await pool.query("UPDATE feed_items SET status='stale' WHERE status='kept' AND fetched_at < NOW() - INTERVAL '2 days'");
-  var items = (await pool.query("SELECT * FROM feed_items WHERE status = 'kept' ORDER BY importance DESC NULLS LAST, id LIMIT 10")).rows;
+  // Best first (relevance already reflects Len's past choices), at most drafts_per_check per news check.
+  var limit = Math.max(1, Math.min(20, parseInt(s.drafts_per_check, 10) || 6));
+  var items = (await pool.query("SELECT * FROM feed_items WHERE status = 'kept' ORDER BY COALESCE(relevance, 0) + COALESCE(importance, 0) DESC, id LIMIT $1", [limit])).rows;
   var made = 0;
   for (var i = 0; i < items.length; i++) {
     var it = items[i];
@@ -708,7 +758,8 @@ async function runPipeline() {
   var drafted = 0;
   try {
     await ingest();
-    for (var n = 0; n < 8; n++) { if (!(await scoreNew())) break; } // up to 200 items per run
+    var prefs = await learnedPreferences().catch(function(e) { console.error('Preferences error:', e.message); return ''; });
+    for (var n = 0; n < 8; n++) { if (!(await scoreNew(prefs))) break; } // up to 200 items per run
     drafted = await draftKept();
     drafted += await draftFiller();
     // News goes stale: drafts nobody approved within 3 days drop out of the queue. Videos stay until Len decides.
@@ -978,6 +1029,18 @@ app.get('/admin', requireAdmin, async function(req, res) {
     return '<div class="card"><div class="meta">' + esc(r.town) + ' · rel ' + esc(r.relevance) + ' / imp ' + esc(r.importance) + ' · ' + esc(r.reason) + '</div><a href="' + esc(r.url) + '" target="_blank" rel="noopener">' + esc(r.title) + '</a></div>';
   }).join('') + '</details>';
 
+  var learned = await decisionStats();
+  var lines = statLines(learned.groups, 3);
+  h += '<details><summary>What it\'s learned from your choices (' + learned.total + ' decisions, last 90 days)</summary><div class="card">' +
+    (learned.total < 5 ? 'It starts using your choices after 5 approvals, rejections or expired drafts.' :
+      '<div class="meta">The screener sees these numbers and your recent approved and rejected headlines on every news check. It scores stories like the ones you approve higher.</div>' +
+      ['type', 'area', 'source'].map(function(kind) {
+        var rows = lines.filter(function(x) { return x.kind === kind; });
+        return rows.length ? '<b>By ' + kind + '</b><br>' + rows.map(function(x) {
+          return esc(x.name) + ': ' + Math.round(x.rate * 100) + '% approved (' + x.b.approved + ' yes, ' + x.b.rejected + ' no, ' + x.b.expired + ' expired)';
+        }).join('<br>') : '';
+      }).filter(Boolean).join('<br><br>')) + '</div></details>';
+
   h += '<details><summary>Settings</summary><div class="card"><form method="post" action="/admin/settings"><input type="hidden" name="_csrf" value="' + csrf + '">' +
     '<label>Posts per day, news and videos together (1-12)<input type="text" name="posts_per_day" value="' + esc(s.posts_per_day) + '"></label><br><br>' +
     '<label>First post (Central, HH:MM)<input type="text" name="first_post" value="' + esc(s.first_post) + '"></label><br><br>' +
@@ -990,6 +1053,7 @@ app.get('/admin', requireAdmin, async function(req, res) {
     '<label>Slow-day community posts per day (0 = off)<input type="text" name="filler_per_day" value="' + esc(s.filler_per_day) + '"></label><br><br>' +
     '<label>Nashville and surrounding counties: minimum relevance (0-10)<input type="text" name="core_min_relevance" value="' + esc(s.core_min_relevance) + '"></label><br><br>' +
     '<label>Wider Middle Tennessee and statewide: minimum importance (0-10)<input type="text" name="wider_min_importance" value="' + esc(s.wider_min_importance) + '"></label><br><br>' +
+    '<label>Most news drafts per news check (3 checks a day; best stories first)<input type="text" name="drafts_per_check" value="' + esc(s.drafts_per_check) + '"></label><br><br>' +
     '<label>Voice<textarea name="voice">' + esc(s.voice) + '</textarea></label>' +
     '<button class="primary">Save settings</button></form></div></details>';
   h += '</main></body></html>';
@@ -1085,7 +1149,7 @@ app.post('/admin/run', requireAdmin, function(req, res) {
 });
 
 app.post('/admin/settings', requireAdmin, async function(req, res) {
-  var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_time', 'email_until', 'badge_text', 'badge_phones', 'credit_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance'];
+  var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_time', 'email_until', 'badge_text', 'badge_phones', 'credit_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance', 'drafts_per_check'];
   for (var i = 0; i < keys.length; i++) {
     var v = (req.body[keys[i]] || '').replace(/\r\n/g, '\n').trim();
     if (v) await pool.query('INSERT INTO settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value', [keys[i], v]);
@@ -1273,7 +1337,7 @@ if (require.main === module) {
   }).catch(function(e) { console.error('Startup failed:', e.message); process.exit(1); });
 }
 
-module.exports = { app: app, pool: pool, videoForm: videoForm, readListing: readListing, postText: postText, badgeFrom: badgeFrom, DEFAULT_SETTINGS: DEFAULT_SETTINGS, initDb: initDb, draftFiller: draftFiller, draftVideo: draftVideo, scheduleDraft: scheduleDraft, buildDigest: buildDigest, renderDraftCard: renderDraftCard,
+module.exports = { app: app, pool: pool, learnedPreferences: learnedPreferences, statLines: statLines, videoForm: videoForm, readListing: readListing, postText: postText, badgeFrom: badgeFrom, DEFAULT_SETTINGS: DEFAULT_SETTINGS, initDb: initDb, draftFiller: draftFiller, draftVideo: draftVideo, scheduleDraft: scheduleDraft, buildDigest: buildDigest, renderDraftCard: renderDraftCard,
   dateKeyPlus: dateKeyPlus, cardLabel: cardLabel, PHOTOS: PHOTOS, isPlaceholderImage: isPlaceholderImage, slotTimes: slotTimes, emailHours: emailHours, fmtTime: fmtTime,
   signLink: signLink, verifyLink: verifyLink, renderCard: renderCard, wrapText: wrapText, findPreviewImage: findPreviewImage, photoCaption: photoCaption, checkWarnings: checkWarnings,
   cleanTitle: cleanTitle, titleKey: titleKey, similar: similar, localParts: localParts, localDateParts: localDateParts, localSlotToDate: localSlotToDate, localKey: localKey,
