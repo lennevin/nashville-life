@@ -1231,7 +1231,15 @@ app.get('/', function(req, res) { res.redirect('/admin'); });
 // ── START ────────────────────────────────────────────────────────────────────
 if (require.main === module) {
   initDb().then(function() {
-    app.listen(PORT, function() { console.log('The Nashville Life listening on', PORT, '| publishing', PUBLISH_ENABLED ? 'ON' : 'OFF', '| videos in', VIDEO_DIR); });
+    var server = app.listen(PORT, function() { console.log('The Nashville Life listening on', PORT, '| publishing', PUBLISH_ENABLED ? 'ON' : 'OFF', '| videos in', VIDEO_DIR); });
+    // Railway stops the old copy with SIGTERM on every deploy (with a volume, the two can't overlap). Exit cleanly so
+    // that doesn't count as a crash and trigger a "deployment crashed" email.
+    process.on('SIGTERM', function() {
+      console.log('Shutting down for a new deploy');
+      cron.getTasks().forEach(function(t) { t.stop(); });
+      setTimeout(function() { process.exit(0); }, 5000).unref();
+      server.close(function() { pool.end().catch(function() {}).then(function() { process.exit(0); }); });
+    });
     // News check 3x a day at 6am, noon and 6pm Nashville time (node-cron follows daylight saving with the timezone option).
     cron.schedule('0 6,12,18 * * *', function() { runPipeline(); }, { timezone: TZ });
     cron.schedule('*/5 * * * *', function() { publishDue().catch(function(e) { console.error('Publisher error:', e.message); }); });
