@@ -58,9 +58,12 @@ ok(s.slotTimes({ posts_per_day: '8', first_post: '07:00', last_post: '21:00' }).
 ok(s.slotTimes({ posts_per_day: '1', first_post: '08:00', last_post: '20:00' }).join(',') === '08:00', 'one slot');
 ok(s.slotTimes({ posts_per_day: 'x', first_post: 'bad', last_post: '' }).length === 8, 'bad settings fall back to defaults');
 ok(s.fmtTime('14:50') === '2:50pm' && s.fmtTime('07:00') === '7:00am' && s.fmtTime('12:10') === '12:10pm', 'friendly times');
-var eh = s.emailHours({ digest_time: '06:30', email_until: '21:00' });
-ok(eh.from === 390 && eh.until === 1260, 'approval email hours');
-ok(s.emailHours({ digest_time: 'off', email_until: '21:00' }) === null, 'approval email off');
+var times = s.digestTimes(s.DEFAULT_SETTINGS);
+ok(times.join(',') === '07:00,18:30', 'two approval emails a day by default');
+ok(s.digestTimes({ digest_times: 'off' }).length === 0 && s.digestTimes({ digest_times: '18:30, bad, 07:00' }).join(',') === '07:00,18:30', 'email times parsed, sorted, bad ones dropped');
+ok(s.dueDigestSlot(times, { y: 2026, m: 10, d: 14, hour: 6, min: 59 }) === null, 'no email before 7am');
+ok(s.dueDigestSlot(times, { y: 2026, m: 10, d: 14, hour: 12, min: 5 }) === '2026-11-14 07:00', 'midday: the 7am email is the one due');
+ok(s.dueDigestSlot(times, { y: 2026, m: 10, d: 14, hour: 21, min: 0 }) === '2026-11-14 18:30', 'evening: the 6:30pm email is due');
 var exp = Math.floor(Date.now() / 1000) + 3600;
 var tok = s.signLink('12', 'approve', exp);
 ok(s.verifyLink('12', 'approve', exp, tok), 'signed email link verifies');

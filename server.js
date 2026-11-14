@@ -97,8 +97,8 @@ const DEFAULT_SETTINGS = {
   posts_per_day: '8',   // posting slots (news and videos together), spread evenly from first_post to last_post (Central time)
   first_post: '07:00',
   last_post: '21:00',
-  digest_time: '06:30', // approval emails start (Central time); "off" = never
-  email_until: '21:00', // no approval emails after this; overnight drafts go out at digest_time
+  digest_times: '07:00,18:30', // approval emails, Central time, comma-separated; "off" = never (Len: 2 a day)
+  digest_last: '',             // "YYYY-MM-DD HH:MM" of the last email time handled
   voice: 'Friendly, plain-spoken local news for Nashville-area neighbors. Warm but factual, never hype. Short sentences. ' +
          'At most one emoji, usually none. No hashtags except an occasional #Nashville.',
   // Every post credits Len and the brokerage (Len's standard for all community Pages): the badge on image cards and the
@@ -767,7 +767,7 @@ async function runPipeline() {
   } catch (e) { console.error('Pipeline error:', e.message); }
   finally { pipelineRunning = false; }
   // New drafts → approval email right away (inside email hours; otherwise the morning email picks them up).
-  if (drafted) await sendDigest(false).catch(function(e) { console.error('Digest error:', e.message); });
+  // No email here: approval emails go out only at the digest_times (the 5-minute cron).
 }
 
 // ── SCHEDULING & PUBLISHING ──────────────────────────────────────────────────
@@ -1005,7 +1005,7 @@ app.get('/admin', requireAdmin, async function(req, res) {
     '<br>Last 24h items: ' + (counts.map(function(c) { return esc(c.status) + ' ' + c.n; }).join(', ') || 'none') +
     (lastPublish.at ? '<br>Last publish: ' + esc(lastPublish.result) : '') +
     '<br>Posting times: ' + slotTimes(s).map(fmtTime).join(', ') + ' (Central)' +
-    '<br>Approval email: ' + (emailHours(s) ? 'after each news check that finds new posts, ' + fmtTime(s.digest_time) + '–' + fmtTime(s.email_until) + ' to ' + esc(DIGEST_TO.join(', ')) : 'off') +
+    '<br>Approval email: ' + (digestTimes(s).length ? digestTimes(s).map(fmtTime).join(' and ') + ' (Central) when there are new drafts, to ' + esc(DIGEST_TO.join(', ')) : 'off') +
     (RESEND_API_KEY ? '' : ' · <b style="color:#b3261e">RESEND_API_KEY missing</b>') +
     (lastDigest.at ? ' · last: ' + esc(lastDigest.result) : '') +
     '<div class="row"><form method="post" action="/admin/run"><input type="hidden" name="_csrf" value="' + csrf + '"><button>Check news now</button></form>' +
@@ -1045,8 +1045,7 @@ app.get('/admin', requireAdmin, async function(req, res) {
     '<label>Posts per day, news and videos together (1-12)<input type="text" name="posts_per_day" value="' + esc(s.posts_per_day) + '"></label><br><br>' +
     '<label>First post (Central, HH:MM)<input type="text" name="first_post" value="' + esc(s.first_post) + '"></label><br><br>' +
     '<label>Last post (Central, HH:MM)<input type="text" name="last_post" value="' + esc(s.last_post) + '"></label><br><br>' +
-    '<label>Approval emails from (Central, HH:MM, or "off")<input type="text" name="digest_time" value="' + esc(s.digest_time) + '"></label><br><br>' +
-    '<label>Approval emails until (Central, HH:MM)<input type="text" name="email_until" value="' + esc(s.email_until) + '"></label><br><br>' +
+    '<label>Approval email times (Central, HH:MM, comma-separated, or "off")<input type="text" name="digest_times" value="' + esc(s.digest_times) + '"></label><br><br>' +
     '<label>Image badge, after "Brought to you by" ("off" hides it)<input type="text" name="badge_text" maxlength="60" value="' + esc(s.badge_text) + '"></label><br><br>' +
     '<label>Image badge, phone line ("off" hides it)<input type="text" name="badge_phones" maxlength="60" value="' + esc(s.badge_phones) + '"></label><br><br>' +
     '<label>Credit line at the end of every post (name, firm and firm phone for TN advertising rules; "off" hides it)<textarea name="credit_line" style="min-height:60px">' + esc(s.credit_line) + '</textarea></label><br><br>' +
@@ -1149,7 +1148,7 @@ app.post('/admin/run', requireAdmin, function(req, res) {
 });
 
 app.post('/admin/settings', requireAdmin, async function(req, res) {
-  var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_time', 'email_until', 'badge_text', 'badge_phones', 'credit_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance', 'drafts_per_check'];
+  var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_times', 'badge_text', 'badge_phones', 'credit_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance', 'drafts_per_check'];
   for (var i = 0; i < keys.length; i++) {
     var v = (req.body[keys[i]] || '').replace(/\r\n/g, '\n').trim();
     if (v) await pool.query('INSERT INTO settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value', [keys[i], v]);
@@ -1217,30 +1216,40 @@ async function buildDigest() {
     ids: pending.map(function(d) { return d.id; }) };
 }
 function fmtTime(hhmm) { var m = toMinutes(hhmm); var h = Math.floor(m / 60); return (h % 12 || 12) + ':' + pad2(m % 60) + (h < 12 ? 'am' : 'pm'); }
+async function markDigest(slot) {
+  await pool.query("INSERT INTO settings (key, value) VALUES ('digest_last', $1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [slot]);
+}
 
-// Approval emails go out when there are pending drafts not yet emailed (normally right after a news check),
-// only between digest_time and email_until (Central). Overnight drafts wait for the morning; the 5-minute cron catches that.
-function emailHours(s) {
-  var from = toMinutes(s.digest_time), until = toMinutes(s.email_until);
-  if (from === null) return null;
-  return { from: from, until: until === null ? 21 * 60 : until };
+// Approval emails go out at fixed times only (digest_times, Central; Len wants two a day). At each time, if any news
+// or community draft arrived since the last email, one email lists everything waiting. Each time is handled once a day
+// (digest_last), so a manual news check in between never adds a third email.
+function digestTimes(s) {
+  if (String(s.digest_times || '').trim() === 'off') return [];
+  return String(s.digest_times || '').split(',').map(function(t) { return t.trim(); }).filter(function(t) { return toMinutes(t) !== null; })
+    .sort(function(a, b) { return toMinutes(a) - toMinutes(b); });
+}
+// The most recent email time that has passed today, as "YYYY-MM-DD HH:MM", or null before the first one.
+function dueDigestSlot(times, p) {
+  var mins = p.hour * 60 + p.min, due = null;
+  times.forEach(function(t) { if (toMinutes(t) <= mins) due = t; });
+  return due ? p.y + '-' + pad2(p.m + 1) + '-' + pad2(p.d) + ' ' + due : null;
 }
 var lastDigest = { at: null, result: null }, digestFailedAt = 0;
 async function sendDigest(force) {
-  var s = await getSettings();
+  var s = await getSettings(), slot = null;
   if (!force) {
-    var hrs = emailHours(s);
-    var lp = localParts(new Date()), mins = lp.hour * 60 + lp.min;
-    if (!hrs || mins < hrs.from || mins >= hrs.until || !RESEND_API_KEY) return;
+    slot = dueDigestSlot(digestTimes(s), localParts(new Date()));
+    if (!slot || slot === s.digest_last || !RESEND_API_KEY) return;
     if (Date.now() - digestFailedAt < 30 * 60 * 1000) return; // back off 30 min after a failed send
     // Len uploaded the videos himself, so videos alone don't trigger an email.
     var unsent = (await pool.query("SELECT COUNT(*)::int AS n FROM drafts WHERE status='pending' AND emailed_at IS NULL AND kind <> 'video'")).rows[0].n;
-    if (!unsent) return;
+    if (!unsent) { await markDigest(slot); return; } // nothing new at this time; wait for the next one
   }
   var d = await buildDigest();
-  if (!d) { lastDigest = { at: new Date().toISOString(), result: 'nothing waiting; no email' }; return; }
+  if (!d) { lastDigest = { at: new Date().toISOString(), result: 'nothing waiting; no email' }; if (slot) await markDigest(slot); return; }
   try {
     await sendEmail(d.subject, d.html);
+    if (slot) await markDigest(slot);
     await pool.query('UPDATE drafts SET emailed_at=NOW() WHERE id = ANY($1) AND emailed_at IS NULL', [d.ids]);
     lastDigest = { at: new Date().toISOString(), result: 'sent (' + d.fresh + ' new, ' + d.count + ' waiting) to ' + DIGEST_TO.join(', ') };
     console.log('Digest:', lastDigest.result);
@@ -1338,7 +1347,7 @@ if (require.main === module) {
 }
 
 module.exports = { app: app, pool: pool, learnedPreferences: learnedPreferences, statLines: statLines, videoForm: videoForm, readListing: readListing, postText: postText, badgeFrom: badgeFrom, DEFAULT_SETTINGS: DEFAULT_SETTINGS, initDb: initDb, draftFiller: draftFiller, draftVideo: draftVideo, scheduleDraft: scheduleDraft, buildDigest: buildDigest, renderDraftCard: renderDraftCard,
-  dateKeyPlus: dateKeyPlus, cardLabel: cardLabel, PHOTOS: PHOTOS, isPlaceholderImage: isPlaceholderImage, slotTimes: slotTimes, emailHours: emailHours, fmtTime: fmtTime,
+  dateKeyPlus: dateKeyPlus, cardLabel: cardLabel, PHOTOS: PHOTOS, isPlaceholderImage: isPlaceholderImage, slotTimes: slotTimes, digestTimes: digestTimes, dueDigestSlot: dueDigestSlot, fmtTime: fmtTime,
   signLink: signLink, verifyLink: verifyLink, renderCard: renderCard, wrapText: wrapText, findPreviewImage: findPreviewImage, photoCaption: photoCaption, checkWarnings: checkWarnings,
   cleanTitle: cleanTitle, titleKey: titleKey, similar: similar, localParts: localParts, localDateParts: localDateParts, localSlotToDate: localSlotToDate, localKey: localKey,
   normalizeUrl: normalizeUrl, videoWarnings: videoWarnings, brokerageLines: brokerageLines, postUrl: postUrl, SOURCES: SOURCES, rss: rss };
