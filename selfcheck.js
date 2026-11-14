@@ -36,13 +36,23 @@ ok(s.dateKeyPlus('2026-10-30', 2) === '2026-11-01', 'date math across months');
 var lines = s.wrapText('West End Avenue closed between 21st and 31st Avenue this weekend for utility work', 26, 4);
 ok(lines.length >= 2 && lines.every(function(l) { return l.length <= 30; }), 'card headline wraps');
 ok(s.wrapText('a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt', 10, 2)[1].slice(-1) === '…', 'long headline truncated with ellipsis');
-var png = s.renderCard('West End Avenue closed this weekend for utility work', 'Nashville', 'traffic_closures', 'NewsChannel 5', null, 'Loyalty Home Group | Real Broker');
+var badge = s.badgeFrom(s.DEFAULT_SETTINGS);
+ok(badge === 'Len Nevin | Loyalty Home Group | Real Broker\nLen 773-632-6316 · Brokerage 844-591-7325', 'badge carries Len, the brokerage and both phones (Len first)');
+ok(s.badgeFrom({ badge_text: 'off', badge_phones: 'x' }) === 'off', 'badge can be turned off');
+var png = s.renderCard('West End Avenue closed this weekend for utility work', 'Nashville', 'traffic_closures', 'NewsChannel 5', null, badge);
 ok(png.length > 5000 && png[1] === 0x50 && png[2] === 0x4e && png[3] === 0x47, 'card renders a PNG');
 if (process.env.CARD_OUT) { require('fs').writeFileSync(process.env.CARD_OUT, png); console.log('card written to', process.env.CARD_OUT); }
 ok(Array.isArray(s.PHOTOS), 'photo library loads (empty is fine)');
 ok(s.cardLabel('Nashville', 'openings') === 'NOW OPEN' && s.cardLabel('Williamson County', 'development_business') === 'WILLIAMSON COUNTY · DEVELOPMENT', 'friendly card labels');
 ok(s.isPlaceholderImage('https://images.foxtv.com/x/img/1280/720/default-image.png?ve=1') && !s.isPlaceholderImage('https://ewscripps.brightspotcdn.com/dims4/default/a7b421c/x.jpg'), 'site placeholder images are skipped, real photos kept');
 ok(s.photoCaption({ message: 'Hello', link: 'https://a.com/x' }) === 'Hello\n\nRead more: https://a.com/x', 'photo post caption carries the article link');
+var credit = s.DEFAULT_SETTINGS.credit_line;
+ok(/Len Nevin/.test(credit) && credit.indexOf('773-632-6316') < credit.indexOf('844-591-7325'), 'credit line names Len, with his phone before the brokerage phone');
+ok(s.postText({ message: 'Hi', link: 'https://a.com/x', image_url: 'https://a.com/i.jpg' }, { credit_line: credit }) === 'Hi\n\n' + credit, 'link post ends with the credit');
+ok(s.postText({ message: 'Hi', link: 'https://a.com/x' }, { credit_line: credit }) === 'Hi\n\nRead more: https://a.com/x\n\n' + credit, 'photo post: link, then the credit');
+ok(s.postText({ kind: 'video', message: 'Home\n\nFull listing: https://x' }, { credit_line: credit }) === 'Home\n\nFull listing: https://x\n\n' + credit, 'Reel ends with the credit');
+ok(s.postText({ message: 'Hi\n\n' + credit }, { credit_line: credit }) === 'Hi\n\n' + credit, 'credit never added twice');
+ok(s.postText({ message: 'Hi' }, { credit_line: 'off' }) === 'Hi', 'credit can be turned off');
 
 ok(s.slotTimes({ posts_per_day: '8', first_post: '07:00', last_post: '21:00' }).join(',') === '07:00,09:00,11:00,13:00,15:00,17:00,19:00,21:00', '8 evenly spaced slots');
 ok(s.slotTimes({ posts_per_day: '1', first_post: '08:00', last_post: '20:00' }).join(',') === '08:00', 'one slot');
@@ -59,15 +69,15 @@ ok(!s.verifyLink('12', 'reject', exp, tok), 'token is bound to the action');
 ok(!s.verifyLink('12', 'approve', exp - 7200, s.signLink('12', 'approve', exp - 7200)), 'expired link rejected');
 
 // Home videos
-var firm = 'Loyalty Home Group | Real Broker, LLC | 615-555-0100';
+var firm = credit;
 ok(s.videoWarnings({ duration: '42', width: '1080', height: '1920', own_listing: 'yes' }, firm).length === 0, 'good vertical video, own listing: no warnings');
 ok(s.videoWarnings({ duration: '120', width: '1080', height: '1920' }, firm).some(function(w) { return /3-90/.test(w); }), 'too-long video flagged');
 ok(s.videoWarnings({ duration: '30', width: '1920', height: '1080' }, firm).some(function(w) { return /vertical/.test(w); }), 'landscape video flagged');
 ok(s.videoWarnings({}, 'Loyalty Home Group | Real Broker, LLC').some(function(w) { return /phone/.test(w); }), 'missing firm phone flagged');
 ok(s.videoWarnings({ own_listing: 'no' }, firm).some(function(w) { return /written OK/.test(w); }), 'other broker listing flagged');
-ok(s.brokerageLines({ own_listing: 'no', listing_brokerage: 'Acme Realty' }, firm) === 'Listing courtesy of Acme Realty\n' + firm, 'listing courtesy line for other brokers');
-ok(s.brokerageLines({ own_listing: 'yes' }, firm) === firm, 'own listing: just the firm line');
-ok(s.brokerageLines({ own_listing: 'yes', listing_url: 'https://x.com/l/1' }, firm) === 'Full listing: https://x.com/l/1\n' + firm, 'listing link goes before the firm line');
+ok(s.brokerageLines({ own_listing: 'no', listing_brokerage: 'Acme Realty' }) === 'Listing courtesy of Acme Realty', 'listing courtesy line for other brokers');
+ok(s.brokerageLines({ own_listing: 'yes' }) === '', 'own listing, no link: nothing extra');
+ok(s.brokerageLines({ own_listing: 'yes', listing_url: 'https://x.com/l/1' }) === 'Full listing: https://x.com/l/1', 'listing link line');
 ok(s.videoWarnings({ listing_url: 'https://x.com/l/1', page_read: false }, firm).some(function(w) { return /listing page/.test(w); }), 'unreadable listing page flagged');
 ok(s.postUrl('reel:123') === 'https://www.facebook.com/reel/123' && s.postUrl('1_2') === 'https://www.facebook.com/1/posts/2', 'post links');
 console.log('selfcheck: ' + n + ' checks passed');

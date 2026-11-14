@@ -16,7 +16,8 @@ AI-assisted community Facebook Page for Nashville and the surrounding counties, 
 5. **Approve** at `/admin` (basic auth, any username + `ADMIN_PASSWORD`) or from the approval email (Resend, signed links, GET shows a confirmation page and POST does the action).
 6. **Publish** every 5 min into `posts_per_day` slots (default 8, 07:00–21:00 Central, so 7, 9, 11am, 1, 3, 5, 7 and 9pm). Posts are never within 45 min of each other.
    - **Link post:** when the article has an og:image.
-   - **Photo post:** otherwise, using a 1200×630 card (navy with the skyline and a "Brought to you by" badge).
+   - **Photo post:** otherwise, using a 1200×630 card (navy with the skyline and a "Brought to you by" badge: `badge_text` + `badge_phones`).
+   - **Credit (Len's standard for every Page):** `postText()` ends every post (link, photo, Reel) with the `credit_line` setting: "Brought to you by Len Nevin | Loyalty Home Group | Real Broker, LLC" plus Len 773-632-6316 · Brokerage 844-591-7325 (Len first). It is added at publish time, never twice; the email shows the final text.
    - Nothing posts unless `PUBLISH_ENABLED=true`.
 
 Time: all wall-clock math goes through `localParts` / `localSlotToDate` (America/Chicago, with daylight saving; the selfcheck covers the DST days). Do not reintroduce fixed UTC offsets.
@@ -33,7 +34,7 @@ Time: all wall-clock math goes through `localParts` / `localSlotToDate` (America
   - The URL warning is skipped for videos.
 - **Warnings** (`videoWarnings`):
   - length or shape problems
-  - no phone number in `firm_line` (Tennessee advertising rule: firm name and phone)
+  - no phone number in `credit_line` (Tennessee advertising rule: firm name and phone)
   - another broker's listing, which needs that broker's written OK
   - "Could not read the listing page" when Claude had no real listing details
 - **Queue:** videos sit in the same queue and share the 8 slots. They never expire, and they don't trigger an approval email on their own.

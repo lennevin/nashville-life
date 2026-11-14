@@ -101,9 +101,11 @@ const DEFAULT_SETTINGS = {
   email_until: '21:00', // no approval emails after this; overnight drafts go out at digest_time
   voice: 'Friendly, plain-spoken local news for Nashville-area neighbors. Warm but factual, never hype. Short sentences. ' +
          'At most one emoji, usually none. No hashtags except an occasional #Nashville.',
-  badge_text: 'Loyalty Home Group | Real Broker', // "Brought to you by" badge on image cards; "off" hides it
-  // Added to the end of every home video caption. Tennessee advertising rules want the firm name and the firm's phone number.
-  firm_line: 'Loyalty Home Group | Real Broker, LLC',
+  // Every post credits Len and the brokerage (Len's standard for all community Pages): the badge on image cards and the
+  // credit line at the end of every post's text. Tennessee advertising rules want the firm name and the firm's phone number.
+  badge_text: 'Len Nevin | Loyalty Home Group | Real Broker', // "Brought to you by" badge on image cards; "off" hides it
+  badge_phones: 'Len 773-632-6316 · Brokerage 844-591-7325',  // second badge line
+  credit_line: 'Brought to you by Len Nevin | Loyalty Home Group | Real Broker, LLC\nLen: 773-632-6316 · Brokerage: 844-591-7325',
   filler_per_day: '2',  // most slow-day community posts drafted for one day; 0 = off
   filler_last: '',      // date slow-day posts were last considered
   core_min_relevance: '6',
@@ -136,6 +138,9 @@ async function initDb() {
   for (var k in DEFAULT_SETTINGS) {
     await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING', [k, DEFAULT_SETTINGS[k]]);
   }
+  // 2026-11-14: the badge gained Len's name; move the old default over (a badge Len edited himself is left alone).
+  await pool.query("UPDATE settings SET value=$1 WHERE key='badge_text' AND value='Loyalty Home Group | Real Broker'", [DEFAULT_SETTINGS.badge_text]);
+  await pool.query("DELETE FROM settings WHERE key='firm_line'"); // replaced by credit_line
   fs.mkdirSync(VIDEO_DIR, { recursive: true });
 }
 
@@ -359,14 +364,23 @@ function labelPill(x, y, label, accent) {
   return '<rect x="' + x + '" y="' + y + '" rx="20" width="' + (label.length * 16.5 + 48) + '" height="40" fill="' + accent + '"/>' +
     '<text x="' + (x + 24) + '" y="' + (y + 28) + '" font-family="Inter" font-weight="700" font-size="22" letter-spacing="2" fill="#ffffff">' + esc(label) + '</text>';
 }
-// Bottom-right sponsor badge. The wording is a setting (badge_text) because the brokerage name must be exact.
+// Bottom-right sponsor badge: "Brought to you by", Len and the brokerage, then the phone numbers on a second line
+// (badge = "name line\nphone line"). The wording is a setting because the brokerage name must be exact.
 function badgeSvg(badge) {
   if (!badge || badge === 'off') return '';
-  var w = Math.max(230, Math.round(badge.length * 11.2) + 40), x = 1200 - 40 - w;
-  return '<rect x="' + x + '" y="528" rx="12" width="' + w + '" height="64" fill="#ffffff" fill-opacity="0.94"/>' +
-    '<text x="' + (x + 20) + '" y="553" font-family="Inter" font-weight="500" font-size="13" letter-spacing="1.5" fill="#64748b">BROUGHT TO YOU BY</text>' +
-    '<text x="' + (x + 20) + '" y="580" font-family="Inter" font-weight="700" font-size="20" fill="#0f172a">' + esc(badge) + '</text>';
+  var lines = String(badge).split('\n'), main = lines[0], phones = lines[1] || '';
+  var w = Math.max(230, Math.round(main.length * 10.6) + 40, Math.round(phones.length * 9) + 40), x = 1200 - 40 - w;
+  if (!phones) {
+    return '<rect x="' + x + '" y="528" rx="12" width="' + w + '" height="64" fill="#ffffff" fill-opacity="0.94"/>' +
+      '<text x="' + (x + 20) + '" y="553" font-family="Inter" font-weight="500" font-size="13" letter-spacing="1.5" fill="#64748b">BROUGHT TO YOU BY</text>' +
+      '<text x="' + (x + 20) + '" y="580" font-family="Inter" font-weight="700" font-size="19" fill="#0f172a">' + esc(main) + '</text>';
+  }
+  return '<rect x="' + x + '" y="502" rx="12" width="' + w + '" height="90" fill="#ffffff" fill-opacity="0.94"/>' +
+    '<text x="' + (x + 20) + '" y="526" font-family="Inter" font-weight="500" font-size="13" letter-spacing="1.5" fill="#64748b">BROUGHT TO YOU BY</text>' +
+    '<text x="' + (x + 20) + '" y="553" font-family="Inter" font-weight="700" font-size="19" fill="#0f172a">' + esc(main) + '</text>' +
+    '<text x="' + (x + 20) + '" y="578" font-family="Inter" font-weight="500" font-size="16" fill="#334155">' + esc(phones) + '</text>';
 }
+function badgeFrom(s) { return s.badge_text === 'off' ? 'off' : s.badge_text + (s.badge_phones && s.badge_phones !== 'off' ? '\n' + s.badge_phones : ''); }
 
 function cardSvg(headline, town, category, source, badge) {
   var accent = CARD_COLORS[category] || CARD_COLORS.other;
@@ -419,7 +433,7 @@ function renderCard(headline, town, category, source, photoFile, badge) {
 }
 async function renderDraftCard(d) {
   var s = await getSettings();
-  return renderCard(d.card_headline, d.town, d.category, d.source_name, d.photo, s.badge_text);
+  return renderCard(d.card_headline, d.town, d.category, d.source_name, d.photo, badgeFrom(s));
 }
 
 // Least recently used photo tagged for the category (any photo if none is tagged), so the Page doesn't repeat itself.
@@ -603,23 +617,23 @@ async function readListing(url) {
     ld.length ? 'Structured data: ' + ld.join(' ').substring(0, 5000) : '', 'Page text: ' + stripTags(html).substring(0, 5000)].filter(Boolean).join('\n');
 }
 // Problems Facebook or the Tennessee advertising rules would have with this video. Flags only; Len decides.
-function videoWarnings(info, firmLine) {
+function videoWarnings(info, creditLine) {
   var w = [];
   var dur = parseFloat(info.duration), vw = parseInt(info.width, 10), vh = parseInt(info.height, 10);
   if (dur && (dur < 3 || dur > 90)) w.push('Reels must be 3-90 seconds (this is ' + Math.round(dur) + 's)');
   if (vw && vh && vh <= vw) w.push('Video is not vertical (' + vw + 'x' + vh + '); Reels need 9:16');
   else if (vw && vh && Math.min(vw, vh) < 540) w.push('Video is small (' + vw + 'x' + vh + '); Reels need at least 540x960');
-  if (!/\d{3}\D{0,3}\d{3}\D{0,3}\d{4}/.test(firmLine || '')) w.push('Add your firm phone number to the brokerage line in Settings (TN advertising rule)');
+  if (!/\d{3}\D{0,3}\d{3}\D{0,3}\d{4}/.test(creditLine || '')) w.push('Add the firm phone number to the credit line in Settings (TN advertising rule)');
   if (info.own_listing === 'no') w.push('Not your listing: you need the listing broker\'s written OK before posting');
   if (info.listing_url && !info.page_read) w.push('Could not read the listing page; check the caption details');
   return w;
 }
-// The end of every Reel caption: the listing link, "Listing courtesy of" for another broker's listing, then the firm line.
-function brokerageLines(info, firmLine) {
+// The end of a Reel caption: the listing link and "Listing courtesy of" for another broker's listing. The credit line
+// (Len, the brokerage and both phones) follows on every post, added by postText at publish time.
+function brokerageLines(info) {
   var lines = [];
   if (info.listing_url) lines.push('Full listing: ' + info.listing_url);
   if (info.own_listing === 'no' && info.listing_brokerage) lines.push('Listing courtesy of ' + info.listing_brokerage);
-  if (firmLine) lines.push(firmLine);
   return lines.join('\n');
 }
 async function draftVideo(info, file) {
@@ -648,9 +662,9 @@ async function draftVideo(info, file) {
     if (!caption && out.found) caption = (out.caption || '').trim();
   } catch (e) { console.error('Video caption error:', e.message); }
   if (!caption) caption = 'New on the market' + (info.city ? ' in ' + info.city : '') + '. Message us for details or a private tour.';
-  var tail = brokerageLines(info, s.firm_line);
+  var tail = brokerageLines(info);
   return insertDraft({ kind: 'video', town: info.city || 'Nashville', category: 'real_estate', message: caption + (tail ? '\n\n' + tail : ''),
-    card_headline: info.address || 'Home video', video_file: file, video_info: info, extraWarnings: videoWarnings(info, s.firm_line) });
+    card_headline: info.address || 'Home video', video_file: file, video_info: info, extraWarnings: videoWarnings(info, s.credit_line) });
 }
 function videoPath(file) { return path.join(VIDEO_DIR, path.basename(String(file || ''))); }
 function removeVideo(file) { if (file) fs.unlink(videoPath(file), function() {}); }
@@ -748,10 +762,19 @@ async function nextFreeSlot(deadline) {
 // Article has its own image → link post (Facebook builds the card: article photo + clickable link).
 // Everything else (no article image, community posts) → photo post with a card; any link goes in the text. Videos → Reel.
 function photoCaption(d) { return d.message + (d.link ? '\n\nRead more: ' + d.link : ''); }
+// The exact text that goes to Facebook: link posts and Reels use the message as written, photo posts add the article
+// link, and every post ends with the credit line (Len, the brokerage and both phones) unless the text already has it.
+function postText(d, s) {
+  var text = d.kind === 'video' || (d.image_url && d.link) ? d.message : photoCaption(d);
+  var credit = String(s.credit_line || '').trim();
+  return credit && credit !== 'off' && text.indexOf(credit) < 0 ? text + '\n\n' + credit : text;
+}
 
 async function postToFacebook(d) {
   if (!FB_PAGE_TOKEN) throw new Error('FB_PAGE_TOKEN not set');
   if (!FB_PAGE_ID) throw new Error('FB_PAGE_ID not set');
+  var s = await getSettings();
+  d = Object.assign({}, d, { message: postText(d, s) });
   try {
     if (d.kind === 'video') return await postReel(d);
     if (d.image_url && d.link) {
@@ -762,7 +785,7 @@ async function postToFacebook(d) {
     }
     var png = await renderDraftCard(d);
     var form = new FormData();
-    form.append('caption', photoCaption(d));
+    form.append('caption', d.message); // postText already added the article link and the credit
     form.append('access_token', FB_PAGE_TOKEN);
     form.append('source', new Blob([png], { type: 'image/png' }), 'nashville-life.png');
     var p = await axios.post(FB_GRAPH + '/' + FB_PAGE_ID + '/photos', form, { timeout: 60000 });
@@ -872,6 +895,7 @@ function draftCard(d, csrf) {
   return '<div class="card"><div>' + tags + '</div>' + src + preview +
     '<form method="post" action="/admin/draft/' + d.id + '"><input type="hidden" name="_csrf" value="' + csrf + '">' +
     '<textarea name="message">' + esc(d.message) + '</textarea>' +
+    '<div class="meta">Your "Brought to you by" credit line (Settings) is added at the end when it posts.</div>' +
     (d.image_url || d.kind === 'video' ? '' : '<label class="meta">Card headline<input type="text" name="card_headline" maxlength="90" value="' + esc(d.card_headline) + '"></label>' +
       (PHOTOS.length ? '<label class="meta">Photo <select name="photo">' + PHOTOS.map(function(ph) {
         return '<option value="' + esc(ph.file) + '"' + (ph.file === d.photo ? ' selected' : '') + '>' + esc(ph.label) + '</option>';
@@ -960,8 +984,9 @@ app.get('/admin', requireAdmin, async function(req, res) {
     '<label>Last post (Central, HH:MM)<input type="text" name="last_post" value="' + esc(s.last_post) + '"></label><br><br>' +
     '<label>Approval emails from (Central, HH:MM, or "off")<input type="text" name="digest_time" value="' + esc(s.digest_time) + '"></label><br><br>' +
     '<label>Approval emails until (Central, HH:MM)<input type="text" name="email_until" value="' + esc(s.email_until) + '"></label><br><br>' +
-    '<label>Image badge, after "Brought to you by" ("off" hides it)<input type="text" name="badge_text" maxlength="40" value="' + esc(s.badge_text) + '"></label><br><br>' +
-    '<label>Brokerage line at the end of home video captions (firm name and firm phone)<input type="text" name="firm_line" maxlength="120" value="' + esc(s.firm_line) + '"></label><br><br>' +
+    '<label>Image badge, after "Brought to you by" ("off" hides it)<input type="text" name="badge_text" maxlength="60" value="' + esc(s.badge_text) + '"></label><br><br>' +
+    '<label>Image badge, phone line ("off" hides it)<input type="text" name="badge_phones" maxlength="60" value="' + esc(s.badge_phones) + '"></label><br><br>' +
+    '<label>Credit line at the end of every post (name, firm and firm phone for TN advertising rules; "off" hides it)<textarea name="credit_line" style="min-height:60px">' + esc(s.credit_line) + '</textarea></label><br><br>' +
     '<label>Slow-day community posts per day (0 = off)<input type="text" name="filler_per_day" value="' + esc(s.filler_per_day) + '"></label><br><br>' +
     '<label>Nashville and surrounding counties: minimum relevance (0-10)<input type="text" name="core_min_relevance" value="' + esc(s.core_min_relevance) + '"></label><br><br>' +
     '<label>Wider Middle Tennessee and statewide: minimum importance (0-10)<input type="text" name="wider_min_importance" value="' + esc(s.wider_min_importance) + '"></label><br><br>' +
@@ -979,7 +1004,7 @@ app.post('/admin/draft/:id', requireAdmin, async function(req, res) {
     if (message !== null && message && ['approve', 'now', 'save'].indexOf(action) >= 0) {
       var cur = (await pool.query('SELECT kind, video_info FROM drafts WHERE id=$1', [id])).rows[0] || {};
       // Video warnings come from the upload (length, shape, consent), not the caption, so keep them.
-      var vw = cur.kind === 'video' ? videoWarnings(JSON.parse(cur.video_info || '{}'), (await getSettings()).firm_line) : [];
+      var vw = cur.kind === 'video' ? videoWarnings(JSON.parse(cur.video_info || '{}'), (await getSettings()).credit_line) : [];
       await pool.query("UPDATE drafts SET message=$2, warnings=$3, updated_at=NOW() WHERE id=$1 AND status='pending'", [id, message, checkWarnings(message, cur.kind).concat(vw).join('; ') || null]);
       var headline = typeof req.body.card_headline === 'string' ? req.body.card_headline.trim().substring(0, 90) : '';
       if (headline) await pool.query("UPDATE drafts SET card_headline=$2 WHERE id=$1 AND status='pending'", [id, headline]);
@@ -1060,9 +1085,9 @@ app.post('/admin/run', requireAdmin, function(req, res) {
 });
 
 app.post('/admin/settings', requireAdmin, async function(req, res) {
-  var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_time', 'email_until', 'badge_text', 'firm_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance'];
+  var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_time', 'email_until', 'badge_text', 'badge_phones', 'credit_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance'];
   for (var i = 0; i < keys.length; i++) {
-    var v = (req.body[keys[i]] || '').trim();
+    var v = (req.body[keys[i]] || '').replace(/\r\n/g, '\n').trim();
     if (v) await pool.query('INSERT INTO settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value', [keys[i], v]);
   }
   res.redirect('/admin');
@@ -1116,7 +1141,7 @@ async function buildDigest() {
     h += '<div style="border:1px solid #e4e6eb;border-radius:10px;padding:14px;margin:16px 0">' +
       '<div style="font-size:13px;color:#65676b;margin-bottom:6px">' + (d.emailed_at ? '' : '<b style="color:#1877f2">NEW</b> · ') + (kindLabel(d) ? esc(kindLabel(d)) + ' · ' : '') + esc(d.town) + ' · ' + esc((d.category || '').replace(/_/g, ' ')) +
       (d.sensitive ? ' · <b style="color:#8a4b00">sensitive</b>' : '') + (d.warnings ? ' · <b style="color:#b3261e">' + esc(d.warnings) + '</b>' : '') + '</div>' + visual +
-      '<div style="white-space:pre-wrap;font-size:15px;line-height:1.4">' + esc(d.image_url || d.kind === 'video' ? d.message : photoCaption(d)) + '</div>' +
+      '<div style="white-space:pre-wrap;font-size:15px;line-height:1.4">' + esc(postText(d, s)) + '</div>' +
       (d.feed_item_id ? '<div style="font-size:13px;margin:8px 0"><a href="' + esc(d.link) + '" style="color:#1a56c4">' + esc(d.source_name) + ': ' + esc(d.title) + '</a></div>'
         : '<div style="font-size:13px;margin:8px 0;color:#65676b">' + esc(kindLabel(d) || 'community post') + (d.post_by ? ' · good until ' + esc(fmtLocal(d.post_by)) : '') + '</div>') +
       emailButton(emailLink('/email/approve/' + d.id, String(d.id), 'approve'), 'Approve', true) +
@@ -1248,7 +1273,7 @@ if (require.main === module) {
   }).catch(function(e) { console.error('Startup failed:', e.message); process.exit(1); });
 }
 
-module.exports = { app: app, pool: pool, videoForm: videoForm, readListing: readListing, initDb: initDb, draftFiller: draftFiller, draftVideo: draftVideo, scheduleDraft: scheduleDraft, buildDigest: buildDigest, renderDraftCard: renderDraftCard,
+module.exports = { app: app, pool: pool, videoForm: videoForm, readListing: readListing, postText: postText, badgeFrom: badgeFrom, DEFAULT_SETTINGS: DEFAULT_SETTINGS, initDb: initDb, draftFiller: draftFiller, draftVideo: draftVideo, scheduleDraft: scheduleDraft, buildDigest: buildDigest, renderDraftCard: renderDraftCard,
   dateKeyPlus: dateKeyPlus, cardLabel: cardLabel, PHOTOS: PHOTOS, isPlaceholderImage: isPlaceholderImage, slotTimes: slotTimes, emailHours: emailHours, fmtTime: fmtTime,
   signLink: signLink, verifyLink: verifyLink, renderCard: renderCard, wrapText: wrapText, findPreviewImage: findPreviewImage, photoCaption: photoCaption, checkWarnings: checkWarnings,
   cleanTitle: cleanTitle, titleKey: titleKey, similar: similar, localParts: localParts, localDateParts: localDateParts, localSlotToDate: localSlotToDate, localKey: localKey,
