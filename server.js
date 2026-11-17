@@ -786,11 +786,12 @@ function slotTimes(s) {
 }
 
 // deadline: a time-sensitive draft (post_by) that can't make a regular slot in time posts as soon as possible.
-async function nextFreeSlot(deadline) {
+// excludeId: a scheduled draft looking for an earlier slot doesn't count its own time as taken.
+async function nextFreeSlot(deadline, excludeId) {
   var s = await getSettings();
   var slots = slotTimes(s);
   var cap = slots.length;
-  var taken = (await pool.query("SELECT scheduled_at FROM drafts WHERE status IN ('scheduled','publishing','published') AND scheduled_at > NOW() - INTERVAL '1 day'")).rows
+  var taken = (await pool.query("SELECT scheduled_at FROM drafts WHERE status IN ('scheduled','publishing','published') AND scheduled_at > NOW() - INTERVAL '1 day' AND id <> $1", [excludeId || 0])).rows
     .map(function(r) { return new Date(r.scheduled_at).getTime(); });
   var today = localDateParts(new Date());
   var soonest = Date.now() + 5 * 60 * 1000;
@@ -855,6 +856,20 @@ function postUrl(fbId) {
 
 var lastPublish = { at: null, result: null };
 // Approve a pending draft into the next open time (before its post_by, if it has one). Returns the time, or null.
+// After the posting schedule changes (e.g. more posts per day), pull already-scheduled posts forward into the new
+// open slots, in their current order, so the queue frees up for new approvals. A post is only ever moved earlier.
+async function repackSchedule() {
+  var rows = (await pool.query("SELECT id, post_by, scheduled_at FROM drafts WHERE status='scheduled' AND scheduled_at > NOW() ORDER BY scheduled_at, id")).rows;
+  var moved = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var slot = await nextFreeSlot(rows[i].post_by, rows[i].id);
+    if (slot.getTime() >= new Date(rows[i].scheduled_at).getTime()) continue;
+    var u = await pool.query("UPDATE drafts SET scheduled_at=$2, updated_at=NOW() WHERE id=$1 AND status='scheduled' RETURNING id", [rows[i].id, slot]);
+    if (u.rows.length) { moved++; console.log('Repack: draft', rows[i].id, 'moved up to', fmtLocal(slot)); }
+  }
+  return moved;
+}
+
 async function scheduleDraft(id) {
   var d = (await pool.query("SELECT post_by FROM drafts WHERE id=$1 AND status='pending'", [id])).rows[0];
   if (!d) return null;
@@ -1149,9 +1164,15 @@ app.post('/admin/run', requireAdmin, function(req, res) {
 
 app.post('/admin/settings', requireAdmin, async function(req, res) {
   var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_times', 'badge_text', 'badge_phones', 'credit_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance', 'drafts_per_check'];
+  var before = slotTimes(await getSettings()).join(',');
   for (var i = 0; i < keys.length; i++) {
     var v = (req.body[keys[i]] || '').replace(/\r\n/g, '\n').trim();
     if (v) await pool.query('INSERT INTO settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value', [keys[i], v]);
+  }
+  // New posting times → move scheduled posts up into the freed slots
+  if (slotTimes(await getSettings()).join(',') !== before) {
+    try { console.log('Settings: posting schedule changed,', await repackSchedule(), 'scheduled posts moved up'); }
+    catch (e) { console.error('Repack error:', e.message); }
   }
   res.redirect('/admin');
 });
