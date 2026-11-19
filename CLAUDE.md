@@ -15,7 +15,7 @@ AI-assisted community Facebook Page for Nashville and the surrounding counties, 
 2b. **Learning from Len** (`learnedPreferences`, `decisionStats`): every news draft Len approves (scheduled/published/failed), rejects or lets expire is a vote. Each run the screener prompt gets his approval record by type, area and source (last 90 days, groups with 4+ votes) plus his last 40 approved, 40 rejected and 15 expired headlines, and is told to score lookalikes of rejected stories at relevance 4 or less while keeping big news. Starts after 5 decisions. `/admin` shows the rates under "What it's learned".
 4. **Slow-day posts** (`draftFiller`): from 2pm, Claude drafts up to `filler_per_day` (default 2) community posts for tomorrow when there are open slots: Nashville facts, questions and tips. Photo posts only once `assets/photos` has photos; the library is empty for now.
 5. **Approve** at `/admin` (basic auth, any username + `ADMIN_PASSWORD`) or from the approval email (Resend, signed links, GET shows a confirmation page and POST does the action). The approval email goes out only at the `digest_times` setting (default 07:00 and 18:30 Central; Len wants 2 a day), when a non-video draft arrived since the last one; `digest_last` makes each time fire once a day.
-6. **Publish** every 5 min into `posts_per_day` slots (default 8, 07:00–21:00 Central, so 7, 9, 11am, 1, 3, 5, 7 and 9pm). Posts are never within 45 min of each other.
+6. **Publish** every 5 min into `posts_per_day` slots (1–24, default 8, spread evenly 07:00–21:00 Central; Len set 18 on 2026-11-19 → about every 50 min). Posts are never within 45 min of each other. Raising `posts_per_day` leaves scheduled posts where they are, so new approvals fill the gaps; any other schedule change moves scheduled posts up (`repackSchedule`).
    - **Link post:** when the article has an og:image.
    - **Photo post:** otherwise, using a 1200×630 card (navy with the skyline and a "Brought to you by" badge: `badge_text` + `badge_phones`).
    - **Credit (Len's standard for every Page):** `postText()` ends every post (link, photo, Reel) with the `credit_line` setting: "Brought to you by Len Nevin | Loyalty Home Group | Real Broker, LLC" plus Len 773-632-6316 · Brokerage 844-591-7325 (Len first). It is added at publish time, never twice; the email shows the final text.
@@ -38,7 +38,7 @@ Time: all wall-clock math goes through `localParts` / `localSlotToDate` (America
   - no phone number in `credit_line` (Tennessee advertising rule: firm name and phone)
   - another broker's listing, which needs that broker's written OK
   - "Could not read the listing page" when Claude had no real listing details
-- **Queue:** videos sit in the same queue and share the 8 slots. They never expire, and they don't trigger an approval email on their own.
+- **Queue:** videos sit in the same queue and share the daily slots. They never expire, and they don't trigger an approval email on their own.
 - **Publishing** (`postReel`): `POST /{page}/video_reels` with `upload_phase=start` → upload the bytes to the returned `upload_url` (rupload, `Authorization: OAuth <token>`, `offset`, `file_size`) → `upload_phase=finish`, `video_state=PUBLISHED`, `description`. The post id is stored as `reel:<video_id>` and links to facebook.com/reel/<id>. The file is deleted once posted or rejected.
 
 ## Railway variables

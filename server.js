@@ -773,7 +773,7 @@ async function runPipeline() {
 // ── SCHEDULING & PUBLISHING ──────────────────────────────────────────────────
 // Evenly spaced posting times, rounded to 5 minutes. 8 posts from 07:00 to 21:00 → 07:00, 09:00, 11:00, ... 21:00.
 function slotTimes(s) {
-  var n = Math.max(1, Math.min(12, parseInt(s.posts_per_day, 10) || 8));
+  var n = Math.max(1, Math.min(24, parseInt(s.posts_per_day, 10) || 8));
   var a = toMinutes(s.first_post), b = toMinutes(s.last_post);
   if (a === null) a = 7 * 60;
   if (b === null || b <= a) b = Math.min(a + 14 * 60, 23 * 60);
@@ -1057,7 +1057,7 @@ app.get('/admin', requireAdmin, async function(req, res) {
       }).filter(Boolean).join('<br><br>')) + '</div></details>';
 
   h += '<details><summary>Settings</summary><div class="card"><form method="post" action="/admin/settings"><input type="hidden" name="_csrf" value="' + csrf + '">' +
-    '<label>Posts per day, news and videos together (1-12)<input type="text" name="posts_per_day" value="' + esc(s.posts_per_day) + '"></label><br><br>' +
+    '<label>Posts per day, news and videos together (1-24; posts stay at least 45 min apart)<input type="text" name="posts_per_day" value="' + esc(s.posts_per_day) + '"></label><br><br>' +
     '<label>First post (Central, HH:MM)<input type="text" name="first_post" value="' + esc(s.first_post) + '"></label><br><br>' +
     '<label>Last post (Central, HH:MM)<input type="text" name="last_post" value="' + esc(s.last_post) + '"></label><br><br>' +
     '<label>Approval email times (Central, HH:MM, comma-separated, or "off")<input type="text" name="digest_times" value="' + esc(s.digest_times) + '"></label><br><br>' +
@@ -1164,13 +1164,16 @@ app.post('/admin/run', requireAdmin, function(req, res) {
 
 app.post('/admin/settings', requireAdmin, async function(req, res) {
   var keys = ['posts_per_day', 'first_post', 'last_post', 'digest_times', 'badge_text', 'badge_phones', 'credit_line', 'filler_per_day', 'voice', 'core_min_relevance', 'wider_min_importance', 'drafts_per_check'];
-  var before = slotTimes(await getSettings()).join(',');
+  var old = await getSettings(), before = slotTimes(old).join(',');
   for (var i = 0; i < keys.length; i++) {
     var v = (req.body[keys[i]] || '').replace(/\r\n/g, '\n').trim();
     if (v) await pool.query('INSERT INTO settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value', [keys[i], v]);
   }
-  // New posting times → move scheduled posts up into the freed slots
-  if (slotTimes(await getSettings()).join(',') !== before) {
+  // New posting times → move scheduled posts up into the freed slots. When posts_per_day goes UP, scheduled posts
+  // keep their times and new approvals fill the gaps first (Len, 2026-11-19).
+  var now = await getSettings();
+  var grew = (parseInt(now.posts_per_day, 10) || 8) > (parseInt(old.posts_per_day, 10) || 8);
+  if (!grew && slotTimes(now).join(',') !== before) {
     try { console.log('Settings: posting schedule changed,', await repackSchedule(), 'scheduled posts moved up'); }
     catch (e) { console.error('Repack error:', e.message); }
   }

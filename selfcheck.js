@@ -56,6 +56,10 @@ ok(s.postText({ message: 'Hi' }, { credit_line: 'off' }) === 'Hi', 'credit can b
 
 ok(s.slotTimes({ posts_per_day: '8', first_post: '07:00', last_post: '21:00' }).join(',') === '07:00,09:00,11:00,13:00,15:00,17:00,19:00,21:00', '8 evenly spaced slots');
 ok(s.slotTimes({ posts_per_day: '1', first_post: '08:00', last_post: '20:00' }).join(',') === '08:00', 'one slot');
+(function() {
+  var t = s.slotTimes({ posts_per_day: '18', first_post: '07:00', last_post: '21:00' }).map(function(x) { return +x.slice(0, 2) * 60 + +x.slice(3); });
+  ok(t.length === 18 && t[0] === 420 && t[17] === 1260 && t.every(function(m, i) { return i === 0 || m - t[i - 1] >= 45; }), '18 slots, 7am-9pm, at least 45 min apart');
+})();
 ok(s.slotTimes({ posts_per_day: 'x', first_post: 'bad', last_post: '' }).length === 8, 'bad settings fall back to defaults');
 ok(s.fmtTime('14:50') === '2:50pm' && s.fmtTime('07:00') === '7:00am' && s.fmtTime('12:10') === '12:10pm', 'friendly times');
 var times = s.digestTimes(s.DEFAULT_SETTINGS);
